@@ -1,0 +1,520 @@
+#!/usr/bin/perl
+
+#   Disk Usage Script
+#   By Derrick Gold (2013)
+#
+#   CMPT 220 AS40(1)
+#   Nicholas Boers
+#
+
+#Line Stats
+#http://cloc.sourceforge.net v 1.56  T=0.5 s (2.0 files/s, 870.0 lines/s)
+#-------------------------------------------------------------------------------
+#Language                     files          blank        comment           code
+#-------------------------------------------------------------------------------
+#Perl                             1             104           222            289
+#-------------------------------------------------------------------------------
+
+use strict;
+#use warnings;
+use Getopt::Std;
+use Cwd 'realpath';
+
+#file size units
+use constant {
+	GBYTE => 1073742824,
+	MBYTE => 1048576,
+	KBYTE => 1024,
+	BYTE => 1,
+};
+
+#Color codes from
+# http://pueblo.sourceforge.net/doc/manual/ansi_color_codes.html
+use constant {
+	BLACK => 30, RED => 31, GREEN => 32, YELLOW => 33,
+	BLUE => 34, PURPLE => 35, CYAN => 36, WHITE => 37,
+	BASE_COLOR => 30, OFF => 0, MAX_COLORS => 7,
+};
+
+#script configurations
+use constant {
+	#max string length to use for printing entries
+	MAX_NAME_LEN => 32,
+	#max number of #'s to draw for largest file
+	HISTOGRAM_MAX => 20,
+	#print file count every PRINT_AT files
+	PRINT_AT => 100,
+	#character to print histogram with
+	HIST_CHAR => "#",
+};
+
+#Messages
+use constant {
+	MULTI_DISPOPTS => "Too many size arguments!\n",
+	PERM_ERROR_READ => "Read permissions required for: ",
+	LINK_ERROR_DIR => "Skipping dir symbolic link: ",
+	TOP_DIR => "Already at top directory.\n",
+	NO_ENTRY => "No such entry in this directory.\n",
+	EMPTY_DIR => "This directory is empty!\n",
+	BAD_INPUT => "Invalid input.\n",
+};
+
+#Data structure design
+#%dir {
+#	. => [dir path, dir size]
+#	.. => [,,,,,,,,,,,,,,\%parent dir ref]
+#	entry => [size, ISDIR, \%dir ref]
+#}
+#data structure constants
+use constant {
+	SIZE => 0, ISDIR => 1, DIRREF => 2,
+};
+
+#Stores inaccessible file and directory messages.
+my @ERRORLOG = ("== Error Log ==\n");
+my %OPTIONS; #program options supplied via ARGV
+my $BASEDIR; #base directory to scan
+my $TOTALFILES = 0; #Total files counted while scanning
+
+sub min($$) {
+	return ($_[0] < $_[1] ? $_[0] : $_[1]);
+}
+
+#Returns a string that changes the text color if
+#option c is enabled. The argument provided is a color
+#constant as defined at the top of this script. e.g. RED.
+sub textCol($) {
+	return sprintf("\x1b[%d;%dm", $_[0] != OFF, $_[0]) x $OPTIONS{c};
+}
+
+sub printUsage {
+	print (STDOUT <<_usageText);
+
+Usage: dui [options] directory
+Options:
+	-N num	Display only the top 'num' entries for each directory.
+
+	-g 	Display sizes in 1073742824-byte (1-Gbyte) blocks.
+	-m 	Display sizes in 1048576-byte (1-Mbyte) blocks.
+	-k	Display sizes in 1024-byte (1-Kbyte) blocks.
+	-h 	Dislay sizes as "human-readable" numbers, where
+		all sizes include a suffix to indicate units of
+		bytes or {kilo, mega, giga}bytes.
+
+	-v 	Enable verbose/debugging output.
+	-c 	Enable color.
+	-s 	Enable static print location.
+	-l 	Follow directory symbolic links.
+	-a 	Display hidden files.
+
+_usageText
+}
+
+#Checks to ensure proper arguments and options have been
+#passed to the script. Displays the scripts usage text
+#if the script does not receive its minimum argument
+#requirement.
+sub checkArgs {
+	getopts ("N:gmkhvcsla", \%OPTIONS);
+
+	#make sure we have a path argument give
+	if (@ARGV == 0) {
+		print("No directory specified!\n");
+		printUsage();
+		exit;
+	}
+
+	#Check to ensure the given path is a directory
+	if ( ! -d realpath($ARGV[0]) ) {
+		print ("Invalid directory path: $ARGV[0]");
+		exit 1;
+	}
+
+	$BASEDIR = realpath($ARGV[0]);
+
+	#Make sure no duplicate/multiple display size options are set
+	my $count = grep {$_ =~ /^[hgkm]$/} keys  %OPTIONS;
+	if($count > 1) {
+		print(MULTI_DISPOPTS);
+		printUsage();
+		exit
+	}
+	#if no display size options are set, default to bytes
+	elsif (!$count) { $OPTIONS{b} = 1 }
+
+	#if colours isn't set, set it to 0
+	$OPTIONS{c} = 0 unless (defined $OPTIONS{c});
+}
+
+#Recursively Scans a directory and returns a reference
+#to a directory structure populated with files and sub directories.
+#as well as the file count within the directory and its sub dirs.
+sub scanDir;#suppresses warnings with recursion use.
+
+sub scanDir($$) {
+	my ($curPath, $parentRef, $dirSize) = (@_, 0);
+
+	my $dh = undef;
+	if(!opendir ($dh, $curPath)) {
+	    push (@ERRORLOG, sprintf("%s%s\n", PERM_ERROR_READ, $curPath));
+	    return undef;
+	}
+	#die ("$0: Failed to open $curPath: $!\n");
+
+	my %dirEntries;
+	#store reference to parent dir
+	$dirEntries{".."} = [0..(DIRREF-1),$parentRef, 0];
+
+
+	while (my $entry = readdir($dh)) {
+
+		#skip . and .. to prevent infinite recursion
+		next if ( $entry eq "." || $entry eq ".." );
+		$TOTALFILES++;
+
+		#grab full path of current entry
+		my $destPath = $curPath."/" x ($curPath ne "/").$entry;
+
+		if ($OPTIONS{v}) { print STDERR "$destPath\n" }
+		elsif ($TOTALFILES % PRINT_AT == 0) { print("\r$TOTALFILES") }
+
+		my @entryInfo = 0, 0, undef, 0;
+		#gather entry information
+		my @statInfo = lstat($destPath);
+		$entryInfo[SIZE] = $statInfo[7];
+
+		$dirSize += $entryInfo[SIZE];
+
+		if (-d $destPath && -r $destPath) {
+
+			#If directory is a symbolic link, skip it if l option is not set
+			if (-l  $destPath && !$OPTIONS{l}) {
+				push (@ERRORLOG, sprintf("%s%s\n", LINK_ERROR_DIR, $destPath));
+				next;
+			}
+
+			print STDERR "Entering directory: $destPath\n" if($OPTIONS{v});
+			my ($nextDir, $newSize) = @{scanDir($destPath, \%dirEntries)};
+
+			#add sub dir size to current dir size
+			$dirSize += $newSize;
+
+			#update and store entry information
+			$entryInfo[SIZE] += $newSize;
+			@entryInfo[ISDIR, DIRREF] = (1, $nextDir);
+		}
+
+		$dirEntries{$entry} =  \@entryInfo;
+	}
+
+	close($dh);
+
+	#store current directory information in an accessible place
+	#from within the directory.
+	my @thisStat = lstat($curPath);
+	$dirEntries{"."} = [$curPath, $dirSize + $thisStat[7]];
+
+	return [\%dirEntries, $dirSize];
+}
+
+#Sorts a given directory structure reference by the size of the entries.
+#Returns array of sorted keys.
+sub sortBySize($) {
+	my $dir = $_[0];
+	#temporarily remove . and .. entries from list
+	delete local @{$dir}{'.','..'};
+	return [ sort( { $dir->{$b}[SIZE] <=> $dir->{$a}[SIZE] } keys(%{$dir}))];
+}
+
+#Formats the name so that it:
+#Fits within the specified character display limit ($targetLen) by
+#splitting and joining its resized halves using $joint to mark the
+#removed characters. If the name refers to a directory, $dirMarker is
+#appended. A new string following the above requirements is returned.
+sub formatName($$$) {
+	my ($inString, $targetLen, $isDir) = @_;
+
+	#some helpful strings
+	my ($dirMarker, $joint) = ("/*", "|~|");
+	$isDir = 0 unless (defined $isDir);
+
+	my $shortName = $inString;
+
+	#check if we need to shorten the name
+	my $origLen = length($inString) + ($isDir * length($dirMarker)) + 1;
+	if ((my $rem = $origLen - $targetLen) > 0) {
+		$rem = ($rem + length($joint))>>1;
+		$shortName = substr($inString, 0, ($origLen >> 1) - $rem);
+		$shortName .= $joint.substr($inString, ($origLen >> 1) + $rem);
+	}
+
+	#apply colors or markers to name
+	$shortName = ($isDir) ? textCol(BLUE).$shortName.$dirMarker :
+							textCol(GREEN).$shortName;
+
+	return $shortName.textCol(OFF);
+}
+
+#Given a max size, and the current file size to compare to,
+#a string containing an ASCII  representation of a histogram is returned.
+sub makeHistogram($$){
+	my ($maxBytes, $curBytes) = @_;
+	$maxBytes = 1 if (!$maxBytes);
+
+	#calculate histogram size and color
+	my $entryBarWd = ($curBytes * HISTOGRAM_MAX) / $maxBytes;
+	my $color = int((($curBytes * (MAX_COLORS + 1)) / $maxBytes)) + 1;
+
+	#return histogram as string
+	return textCol($color + BASE_COLOR).(HIST_CHAR x $entryBarWd).textCol(OFF);
+}
+
+#With the size of a file passed in and a divisor, the new size is calculated.
+#If option h is set, and the value is less than 10, a size is returned with
+#one decimal place if applicable. A letter indicating the units of the size
+#is appended to the end of the size if option h is set.
+sub calcSize($$$) {
+	my ($inSize, $divisor, $auto) = @_;
+	if (!defined $divisor || $divisor == 0) {return "0"}
+
+	my %suffix = (GBYTE, "G", MBYTE, "M", KBYTE, "K", BYTE, "B");
+
+	if ($auto) { #Auto convert size and append suffix
+
+		return undef if ($inSize < $divisor && $divisor != BYTE);
+		$inSize /= $divisor;
+		$inSize = ($inSize < 10) ? substr($inSize, 0, 3) : int($inSize);
+		$inSize .= $suffix{$divisor};
+
+	} else { #Force size to a specific block size
+
+		#Only convert for the option that is enabled (g,m,k,b).
+		return undef if (! $OPTIONS{ lc( $suffix{$divisor} ) } );
+
+		#If the input size is less than the block size, it defaults to 1.
+		$inSize = ($inSize < $divisor) ? "1" : int($inSize / $divisor);
+	}
+
+	return $inSize;
+}
+
+#Given a size, based on the OPTIONS unit g,m,k or b, a new string is
+#created using the set unit. When auto is set, a human-readable size
+#is returned.
+sub formatSize($$) {
+	my ($inputSize, $auto, $finalSize) = (@_, undef);
+
+	#Make sure we aren't dividing by zero.
+	return "0" if ($inputSize == 0);
+
+	my @sizes = (GBYTE, MBYTE, KBYTE, BYTE);
+	while (! defined $finalSize) {
+		$finalSize = calcSize($inputSize, shift(@sizes), $auto);
+	}
+
+	return $finalSize;
+}
+
+#Given a reference to a directory structure, a single level
+#of the directory is printed out to the terminal.
+#A list of available hash keys to choose from (what is displayed) is returned.
+sub printBanner($) {
+	my $thisDir = $_[0];
+
+	my ($dirName, $dirSize) = @{$thisDir->{'.'}};
+	$dirSize = textCol(CYAN)." (".formatSize($dirSize, 1).")";
+	print "\n==", textCol(WHITE), $dirName, $dirSize, textCol(OFF), "==\n";
+}
+
+sub printDir($){
+	my ($thisDir, $dirList) = ($_[0], sortBySize($_[0]));
+	my $dirSize = $thisDir->{"."}[1];
+
+	#print the current directory banner
+	printBanner($thisDir);
+
+	#stop here if directory is empty
+	if (@{$dirList} == 0) { print(EMPTY_DIR); return}
+
+	#figure out the minimum number of spaces required
+	#for the largest entry number in the list.
+	my $numPad = ( !$OPTIONS{N} ? length(@{$dirList}) :
+					min(length($OPTIONS{N}), length(@{$dirList})) );
+
+	#calculate space needed to print largest file size in bytes.
+	my $bytePad = length($thisDir->{$dirList->[0]}[SIZE]);
+
+	my ($entryNum, @hashKeys);
+	foreach (@{$dirList}) {
+		#skip the . and .. folders and or hidden files
+		next if ($_ eq "." || $_ eq ".." || ($_ =~ /^\./ && !$OPTIONS{a}));
+
+		$entryNum++;
+		last if ($OPTIONS{N} && $entryNum > $OPTIONS{N});
+
+		#Storing array of files to access directory hash with numerically.
+		push (@hashKeys, $_);
+
+		my @fileInfo = @{$thisDir->{$_}};
+
+		#Even though the color escape codes aren't printed, they are
+		#included in the print buffer and throw off alignments.
+		my $namePad = MAX_NAME_LEN + (length(textCol(OFF))<<1) + $OPTIONS{c};
+
+		printf( "%*d)%-*s %*s %s\n",
+				$numPad, $entryNum,
+				$namePad, formatName($_, MAX_NAME_LEN, $fileInfo[ISDIR]),
+				$bytePad, formatSize($fileInfo[SIZE], $OPTIONS{h}),
+				makeHistogram( $dirSize, $fileInfo[SIZE]) );
+	}
+	print "\n";
+
+	#Return the list of displayed files.
+	return \@hashKeys;
+}
+
+#Print out the information of a file entry selected.
+sub printEntryInfo($@) {
+	my ($path, $fileName, @fileInfo) = @_;
+
+	#stat labels
+	my @labels = ("dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size",
+				"atime", "mtime", "ctime", "blksize", "blocks");
+
+	my $fullPath = $path->{"."}[0] . "/" . $fileName;
+	my @fileStats = lstat($fullPath);
+
+	print (textCol(WHITE), "\n==$fileName==\n", textCol(OFF));
+	#display if the file is a symbolic link
+	print("$fileName -> readlink($fullPath)\n\n") if(-l $fullPath);
+	#Print out stats.
+	print ($_, ": ", shift(@fileStats), "\n") foreach (@labels);
+}
+
+sub waitForKey {
+	print("\nPress Enter to continue.\n");
+	my $temp = <STDIN>;
+}
+
+sub exitScript {
+	my $choice = 0;
+
+	while ($choice ne "y" && $choice ne "n") {
+		print("Exit the script (y/n)? ");
+		chomp($choice = lc(<STDIN>));
+	}
+
+	exit(0) if ($choice eq "y");
+}
+
+#Some of the descriptions here could be used for both
+#this and the usage display, but I'm too lazy to change
+#it now.
+sub printHelp {
+	print (STDOUT <<_helpText);
+=Help Menu=
+	n num	Display only the top 'num' entries for each directory.
+	n 		Display all entries for each directory.
+
+	g 	Display sizes in 1073742824-byte (1-Gbyte) blocks.
+	m 	Display sizes in 1048576-byte (1-Mbyte) blocks.
+	k	Display sizes in 1024-byte (1-Kbyte) blocks.
+	h 	Dislay sizes as "human-readable" numbers, where
+		all sizes include a suffix to indicate units of
+		bytes or {kilo, mega, giga}bytes.
+
+	c 	Enable color.
+	a 	Display hidden files.
+	s 	Enable static print location.
+	e 	View skipped entries.
+	r 	Return to parent directory.
+	q 	Exit Program.
+	# 	Explore specified entry.
+
+_helpText
+}
+
+sub getInput($) {
+	my $dir = $_[0];
+	chomp(my $input = lc(<STDIN>));
+
+	#explore option functions
+	my %funPtr = (
+				  #Return to parent directory
+				  "r" , (sub { return 0 if ($dir ne $BASEDIR);
+						 print(TOP_DIR); waitForKey(); undef}),
+				  #Exit script
+				  "q" , (sub {exitScript(); undef}),
+				  #Display help
+				  "?" , (sub {printHelp(); waitForKey(); undef}),
+				  #View Skipped entries
+				  "e" , (sub {print STDERR "@ERRORLOG"; waitForKey(); undef}));
+
+	#Explore options
+	if($input =~ /^(r|q|\?|e)$/) { my $x = &{$funPtr{$1}}; return $x}
+
+	#program settings
+	elsif ($input =~ /^(c|s|a|n){1} ?(\d*)?$/) {
+		if($1 eq "n"){ $OPTIONS{N} = defined($2) ? $2 : 0;}
+		else { $OPTIONS{$1} = !$OPTIONS{$1} }
+		return undef;
+	}
+
+	#display block sizes
+	elsif ($input =~/^(g|m|k|h|b)$/) {
+		#reset everything first
+		@OPTIONS{'g', 'h', 'k', 'm'} = 0;
+		#then set the input option
+		$OPTIONS{$1} = 1;
+		return undef;
+	}
+
+	#Explore entry number (positive numbers only)
+	elsif ($input =~ /^\d+$/ && $input != 0){ return $input; }
+
+	#improper input
+	else { print(BAD_INPUT); waitForKey(); undef; }
+}
+
+sub clearTerminal() {
+	print("\x1b[1J\x1b[0;0H");
+}
+
+#######################
+#	Main Program
+#######################
+#auto flush text buffer
+$| ++;
+
+checkArgs();
+
+#recursively scan all directories within the base directory
+print "Scanning $BASEDIR for files...\n";
+my ($curDir, $allSize) = @{scanDir($BASEDIR, undef)};
+print "\nDone.\n";
+
+while (1) {
+	#clear screen and reset cursor to home
+	clearTerminal() if ($OPTIONS{s});
+
+	my $dirKeys = printDir($curDir);
+	print("\nExplore (? for help): ");
+
+	my $input = getInput($curDir->{"."}[0]);
+	redo if (! defined $input--);
+	next if ($input > $#{$dirKeys});
+
+	my $workingName = ($input < 0) ? ".." : $dirKeys->[$input];
+	if (my $entryInfo = $curDir->{$workingName}){
+		#Enter directory if selected
+		if ($entryInfo->[ISDIR]) { $curDir = $entryInfo->[DIRREF] }
+		#Or print out file information
+		else {
+			printEntryInfo($curDir, $workingName, @{$entryInfo});
+			waitForKey();
+		}
+		redo;
+	}
+} continue { print (NO_ENTRY); waitForKey();}
+
+exit;
