@@ -2,6 +2,9 @@
 
 An interactive command line interface for viewing disk space usage.
 
+![DUI Interface](/screenshots/dui.png?raw=true "Disk Usage Display")
+
+
 ```
 Usage: dui [options] directory
 
