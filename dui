@@ -194,7 +194,10 @@ sub scanDir($$) {
 			}
 
 			print STDERR "Entering directory: $destPath\n" if($OPTIONS{v});
-			my ($nextDir, $newSize) = @{scanDir($destPath, \%dirEntries)};
+      my $result = scanDir($destPath, \%dirEntries);
+      next if !defined($result);
+
+			my ($nextDir, $newSize) = @{$result};
 
 			#add sub dir size to current dir size
 			$dirSize += $newSize;
